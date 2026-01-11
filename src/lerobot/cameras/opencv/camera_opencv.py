@@ -48,6 +48,35 @@ MAX_OPENCV_INDEX = 60
 logger = logging.getLogger(__name__)
 
 
+def _try_set_opencv_log_level_error() -> None:
+    """Best-effort suppression of OpenCV VideoCapture probe spam.
+
+    On macOS, OpenCV (AVFoundation) prints messages like:
+    "OpenCV: out device of bound (0-2): 3" when probing indices beyond
+    the available range. These are not Python exceptions, so we attempt to
+    reduce OpenCV's internal log level while probing.
+    """
+
+    try:
+        # OpenCV >= 4.0 often exposes cv2.utils.logging
+        if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging") and hasattr(cv2.utils.logging, "setLogLevel"):
+            # 3 is typically "ERROR" in OpenCV's log levels
+            cv2.utils.logging.setLogLevel(3)
+            return
+    except Exception:
+        pass
+
+    try:
+        # Some builds expose cv2.setLogLevel / cv2.LOG_LEVEL_ERROR
+        if hasattr(cv2, "setLogLevel"):
+            if hasattr(cv2, "LOG_LEVEL_ERROR"):
+                cv2.setLogLevel(int(cv2.LOG_LEVEL_ERROR))
+            else:
+                cv2.setLogLevel(3)
+    except Exception:
+        pass
+
+
 class OpenCVCamera(Camera):
     """
     Manages camera interactions using OpenCV for efficient frame recording.
@@ -234,6 +263,13 @@ class OpenCVCamera(Camera):
         if self.fps is None:
             raise ValueError(f"{self} FPS is not set")
 
+        # On macOS (AVFoundation), CAP_PROP_FPS is frequently best-effort and
+        # can cause the stream to stall on some UVC devices even when the
+        # requested FPS appears supported. Treat it as informational
+        if platform.system() == "Darwin":
+            logger.debug(f"{self} skipping CAP_PROP_FPS enforcement on macOS (requested fps={self.fps}).")
+            return
+
         success = self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
         # Use math.isclose for robust float comparison
@@ -300,6 +336,12 @@ class OpenCVCamera(Camera):
         """
         found_cameras_info = []
 
+        # Reduce OpenCV stderr noise during probing (best-effort)
+        _try_set_opencv_log_level_error()
+
+        # Use the same backend selection as runtime camera usage
+        backend = get_cv2_backend()
+
         targets_to_scan: list[str | int]
         if platform.system() == "Linux":
             possible_paths = sorted(Path("/dev").glob("video*"), key=lambda p: p.name)
@@ -307,35 +349,63 @@ class OpenCVCamera(Camera):
         else:
             targets_to_scan = [int(i) for i in range(MAX_OPENCV_INDEX)]
 
+        found_any = False
+        consecutive_failures = 0
+        # On macOS/Windows, indices are typically contiguous from 0..N-1
+        # Stop once we see a few misses after already finding at least one camera
+        max_consecutive_failures_after_found = 5
+
         for target in targets_to_scan:
-            camera = cv2.VideoCapture(target)
-            if camera.isOpened():
-                default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-                default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                default_fps = camera.get(cv2.CAP_PROP_FPS)
-                default_format = camera.get(cv2.CAP_PROP_FORMAT)
+            camera: cv2.VideoCapture | None = None
+            try:
+                if isinstance(target, int):
+                    camera = cv2.VideoCapture(target, backend)
+                else:
+                    # For Linux paths, OpenCV may ignore/override backend.
+                    camera = cv2.VideoCapture(target)
 
-                # Get FOURCC code and convert to string
-                default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
-                default_fourcc_code_int = int(default_fourcc_code)
-                default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
+                if camera.isOpened():
+                    found_any = True
+                    consecutive_failures = 0
 
-                camera_info = {
-                    "name": f"OpenCV Camera @ {target}",
-                    "type": "OpenCV",
-                    "id": target,
-                    "backend_api": camera.getBackendName(),
-                    "default_stream_profile": {
-                        "format": default_format,
-                        "fourcc": default_fourcc,
-                        "width": default_width,
-                        "height": default_height,
-                        "fps": default_fps,
-                    },
-                }
+                    default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    default_fps = camera.get(cv2.CAP_PROP_FPS)
+                    default_format = camera.get(cv2.CAP_PROP_FORMAT)
 
-                found_cameras_info.append(camera_info)
-                camera.release()
+                    # Get FOURCC code and convert to string
+                    default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
+                    default_fourcc_code_int = int(default_fourcc_code)
+                    default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
+
+                    camera_info = {
+                        "name": f"OpenCV Camera @ {target}",
+                        "type": "OpenCV",
+                        "id": target,
+                        "backend_api": camera.getBackendName(),
+                        "default_stream_profile": {
+                            "format": default_format,
+                            "fourcc": default_fourcc,
+                            "width": default_width,
+                            "height": default_height,
+                            "fps": default_fps,
+                        },
+                    }
+
+                    found_cameras_info.append(camera_info)
+                else:
+                    consecutive_failures += 1
+
+            finally:
+                if camera is not None:
+                    camera.release()
+
+            if (
+                platform.system() != "Linux"
+                and found_any
+                and consecutive_failures >= max_consecutive_failures_after_found
+            ):
+                break
 
         return found_cameras_info
 
@@ -370,7 +440,15 @@ class OpenCVCamera(Camera):
         if self.videocapture is None:
             raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
 
-        ret, frame = self.videocapture.read()
+        ret = False
+        frame = None
+        # AVFoundation can return ret=False for a few frames after opening or
+        # after changing properties; retry briefly before failing.
+        for attempt in range(5):
+            ret, frame = self.videocapture.read()
+            if ret and frame is not None:
+                break
+            time.sleep(0.02)
 
         if not ret or frame is None:
             raise RuntimeError(f"{self} read failed (status={ret}).")

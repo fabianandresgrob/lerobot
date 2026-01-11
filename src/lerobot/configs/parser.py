@@ -14,6 +14,7 @@
 import importlib
 import inspect
 import pkgutil
+import re
 import sys
 from argparse import ArgumentError
 from collections.abc import Callable, Iterable, Sequence
@@ -31,6 +32,13 @@ F = TypeVar("F", bound=Callable[..., object])
 
 PATH_KEY = "path"
 PLUGIN_DISCOVERY_SUFFIX = "discover_packages_path"
+
+
+_NON_PRINTABLE_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+
+def _find_non_printable_args(args: Sequence[str]) -> list[str]:
+    return [arg for arg in args if _NON_PRINTABLE_RE.search(arg) is not None]
 
 
 def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> list[str] | None:
@@ -213,6 +221,15 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                 args = args[1:]
             else:
                 cli_args = sys.argv[1:]
+                bad_args = _find_non_printable_args(cli_args)
+                if bad_args:
+                    joined = "\n".join(f"- {bad!r}" for bad in bad_args)
+                    raise ValueError(
+                        "CLI arguments contain non-printable control characters (e.g., ANSI escape codes like \\x1b). "
+                        "This often happens when copying commands from a colored terminal or when an env var expands to colored output.\n"
+                        "Offending arguments:\n"
+                        f"{joined}"  # noqa: ISC003
+                    )
                 plugin_args = parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, cli_args)
                 for plugin_cli_arg, plugin_path in plugin_args.items():
                     try:

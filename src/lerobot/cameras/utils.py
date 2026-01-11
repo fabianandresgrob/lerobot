@@ -70,7 +70,8 @@ def get_cv2_backend() -> int:
 
     if platform.system() == "Windows":
         return int(cv2.CAP_MSMF)  # Use MSMF for Windows instead of AVFOUNDATION
-    # elif platform.system() == "Darwin":  # macOS
-    #     return cv2.CAP_AVFOUNDATION
+    elif platform.system() == "Darwin":  # macOS
+        # Prefer AVFoundation when present; fallback to CAP_ANY for older OpenCV builds.
+        return int(getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY))
     else:  # Linux and others
         return int(cv2.CAP_ANY)
